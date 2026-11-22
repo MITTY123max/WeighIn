@@ -32,9 +32,7 @@ test("active workflow Actions use full commit SHAs", () => {
   for (const name of fs.readdirSync(workflowDirectory)) {
     if (!/\.ya?ml$/i.test(name)) continue;
     const file = `.github/workflows/${name}`;
-    const workflow = YAML.parse(
-      fs.readFileSync(path.join(root, file), "utf8"),
-    );
+    const workflow = YAML.parse(fs.readFileSync(path.join(root, file), "utf8"));
     inspectUses(workflow, file);
   }
   assert.ok(
