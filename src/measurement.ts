@@ -34,6 +34,33 @@ import {
 } from "@stellar/stellar-sdk";
 
 const DEFAULT_RPC_URL = "http://localhost:8000/rpc";
+export const DEFAULT_DEPLOYMENT_TIMEOUT_SECONDS = 30;
+export const MIN_DEPLOYMENT_TIMEOUT_SECONDS = 1;
+export const MAX_DEPLOYMENT_TIMEOUT_SECONDS = 600;
+
+export function parseDeploymentTimeoutSeconds(raw: string): number {
+  if (!raw) return DEFAULT_DEPLOYMENT_TIMEOUT_SECONDS;
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(
+      `deployment-timeout-seconds must be an integer between ${MIN_DEPLOYMENT_TIMEOUT_SECONDS} and ${MAX_DEPLOYMENT_TIMEOUT_SECONDS} seconds`,
+    );
+  }
+  const seconds = Number(raw);
+  validateDeploymentTimeoutSeconds(seconds);
+  return seconds;
+}
+
+export function validateDeploymentTimeoutSeconds(seconds: number): void {
+  if (
+    !Number.isSafeInteger(seconds) ||
+    seconds < MIN_DEPLOYMENT_TIMEOUT_SECONDS ||
+    seconds > MAX_DEPLOYMENT_TIMEOUT_SECONDS
+  ) {
+    throw new Error(
+      `deployment timeout must be an integer between ${MIN_DEPLOYMENT_TIMEOUT_SECONDS} and ${MAX_DEPLOYMENT_TIMEOUT_SECONDS} seconds`,
+    );
+  }
+}
 
 /** Schema 5 binds each metric to its approved source and cap mapping. */
 export interface MetricValue {
@@ -372,40 +399,112 @@ export async function getOrInitAccount(
   return keypair;
 }
 
-// Poll transaction completion
+const TRANSACTION_POLL_INTERVAL_MS = 1000;
+
+type TransactionRequestResult =
+  | { kind: "response"; response: rpc.Api.GetTransactionResponse }
+  | { kind: "error"; error: unknown };
+
+async function getTransactionBeforeDeadline(
+  server: rpc.Server,
+  txHash: string,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<rpc.Api.GetTransactionResponse | undefined> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
+  const timeoutPromise = new Promise<{ kind: "timeout" }>((resolve) => {
+    timeout = setTimeout(() => resolve({ kind: "timeout" }), timeoutMs);
+  });
+  const abortedPromise = signal
+    ? new Promise<{ kind: "aborted" }>((resolve) => {
+        onAbort = () => resolve({ kind: "aborted" });
+        if (signal.aborted) onAbort();
+        else signal.addEventListener("abort", onAbort, { once: true });
+      })
+    : new Promise<{ kind: "aborted" }>(() => {});
+
+  try {
+    const requestPromise: Promise<TransactionRequestResult> = server
+      .getTransaction(txHash)
+      .then(
+        (response) => ({ kind: "response", response }),
+        (error: unknown) => ({ kind: "error", error }),
+      );
+    const outcome = await Promise.race([
+      requestPromise,
+      timeoutPromise,
+      abortedPromise,
+    ]);
+    if (outcome.kind === "timeout") return undefined;
+    if (outcome.kind === "aborted") {
+      throw signal?.reason || new Error("Transaction confirmation cancelled");
+    }
+    if (outcome.kind === "error") throw outcome.error;
+    return outcome.response;
+  } finally {
+    if (timeout) clearTimeout(timeout);
+    if (onAbort) signal?.removeEventListener("abort", onAbort);
+  }
+}
+
+function waitForTransactionPoll(
+  milliseconds: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason || new Error("Transaction confirmation cancelled"));
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, milliseconds);
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(signal?.reason || new Error("Transaction confirmation cancelled"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 async function waitForTransaction(
   server: rpc.Server,
   txHash: string,
+  phase: string,
+  timeoutSeconds: number,
   signal?: AbortSignal,
 ): Promise<rpc.Api.GetTransactionResponse> {
-  for (let i = 0; i < 30; i++) {
+  const startedAt = Date.now();
+  const deadline = startedAt + timeoutSeconds * 1000;
+  while (Date.now() < deadline) {
     if (signal?.aborted) {
       throw signal.reason || new Error("Transaction confirmation cancelled");
     }
-    const tx = await server.getTransaction(txHash);
+    const remaining = deadline - Date.now();
+    const tx = await getTransactionBeforeDeadline(
+      server,
+      txHash,
+      remaining,
+      signal,
+    );
+    if (!tx) break;
+    if (Date.now() >= deadline) break;
     if (tx.status !== "NOT_FOUND") {
       return tx;
     }
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(resolve, 1000);
-      if (signal) {
-        const onAbort = () => {
-          clearTimeout(timer);
-          reject(
-            signal.reason || new Error("Transaction confirmation cancelled"),
-          );
-        };
-        if (signal.aborted) {
-          clearTimeout(timer);
-          return reject(
-            signal.reason || new Error("Transaction confirmation cancelled"),
-          );
-        }
-        signal.addEventListener("abort", onAbort, { once: true });
-      }
-    });
+    const pollDelay = Math.min(
+      TRANSACTION_POLL_INTERVAL_MS,
+      deadline - Date.now(),
+    );
+    if (pollDelay > 0) await waitForTransactionPoll(pollDelay, signal);
   }
-  throw new Error(`Transaction ${txHash} not found after 30 seconds`);
+  const elapsedSeconds = ((Date.now() - startedAt) / 1000).toFixed(1);
+  throw new Error(
+    `Transaction confirmation deadline expired during ${phase} (hash=${txHash}, elapsed=${elapsedSeconds}s, timeout=${timeoutSeconds}s)`,
+  );
 }
 
 // A transaction hash is 32 hex-encoded bytes.
@@ -451,6 +550,7 @@ async function submitAndConfirm(
   prepared: Transaction,
   phase: string,
   rpcUrl: string,
+  timeoutSeconds: number,
   signal?: AbortSignal,
 ): Promise<rpc.Api.GetSuccessfulTransactionResponse> {
   if (signal?.aborted) {
@@ -488,7 +588,13 @@ async function submitAndConfirm(
       `${phase} submission returned an invalid response (status=${status}): missing or invalid transaction hash`,
     );
   }
-  const confirmed = await waitForTransaction(server, submission.hash, signal);
+  const confirmed = await waitForTransaction(
+    server,
+    submission.hash,
+    phase,
+    timeoutSeconds,
+    signal,
+  );
   if (confirmed.status !== rpc.Api.GetTransactionStatus.SUCCESS) {
     throw new Error(
       `${phase} transaction ${submission.hash} did not succeed (status=${confirmed.status})`,
@@ -740,12 +846,16 @@ export async function ensureContractDeployed(options: {
   salt: Buffer;
   contractId: string;
   rpcUrl: string;
+  deploymentTimeoutSeconds?: number;
   signal?: AbortSignal;
   /** Minimum remaining TTL (ledgers) for a reused instance and its code. */
   minTtlLedgers?: number;
 }): Promise<Pick<SetupResult, "source" | "return_xdr">> {
   const { server, deployer, deployerAddress, wasmBytes, wasmHash, salt } =
     options;
+  const deploymentTimeoutSeconds =
+    options.deploymentTimeoutSeconds ?? DEFAULT_DEPLOYMENT_TIMEOUT_SECONDS;
+  validateDeploymentTimeoutSeconds(deploymentTimeoutSeconds);
   if (options.minTtlLedgers !== undefined) {
     assertValidMinTtl(options.minTtlLedgers);
   }
@@ -803,6 +913,7 @@ export async function ensureContractDeployed(options: {
     preparedUpload,
     "WASM upload",
     options.rpcUrl,
+    deploymentTimeoutSeconds,
     options.signal,
   );
 
@@ -831,6 +942,7 @@ export async function ensureContractDeployed(options: {
     preparedCreate,
     "contract creation",
     options.rpcUrl,
+    deploymentTimeoutSeconds,
     options.signal,
   );
   const result = created.returnValue;
@@ -932,6 +1044,8 @@ export interface RunMeasurementOptions {
   sdkVersion?: string;
   /** Soroban RPC endpoint. Defaults to localhost:8000/rpc. */
   rpcUrl?: string;
+  /** Per-transaction deployment confirmation deadline in seconds (1–600; default 30). */
+  deploymentTimeoutSeconds?: number;
   /**
    * Absolute path to a reusable file that persists the deployer keypair
    * between base and head runs so both use the same funded on-chain account.
@@ -1104,6 +1218,9 @@ export async function runMeasurement(
   if (opts.signal?.aborted) {
     throw opts.signal.reason || new Error("Measurement cancelled by caller");
   }
+  if (opts.deploymentTimeoutSeconds !== undefined) {
+    validateDeploymentTimeoutSeconds(opts.deploymentTimeoutSeconds);
+  }
 
   // Reject an unusable TTL window before reading fixtures, creating a key or
   // touching the network.
@@ -1199,6 +1316,7 @@ async function measureWithKeyFile(
         salt,
         contractId,
         rpcUrl: effectiveRpcUrl,
+        deploymentTimeoutSeconds: opts.deploymentTimeoutSeconds,
         signal: opts.signal,
         minTtlLedgers: opts.minTtlLedgers,
       });

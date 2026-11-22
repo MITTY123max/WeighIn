@@ -2,7 +2,11 @@
 import * as fs from "fs";
 import * as path from "path";
 import { execSync } from "child_process";
-import { runMeasurement } from "./measurement";
+import {
+  DEFAULT_DEPLOYMENT_TIMEOUT_SECONDS,
+  parseDeploymentTimeoutSeconds,
+  runMeasurement,
+} from "./measurement";
 import { parseFixtures } from "./identity";
 import { diffBenchmarks, type DiffResult } from "./diff";
 import { enforceThresholds, loadConfig } from "./threshold";
@@ -21,6 +25,7 @@ export interface CliOptions {
   fixturesPath: string;
   outputPath: string | null;
   rpcUrl: string;
+  deploymentTimeoutSeconds: number;
   helperPath?: string;
   jsonStdout: boolean;
   allowCrossTargetSubstitution: boolean;
@@ -50,6 +55,8 @@ Positional arguments:
 
 Options:
   --rpc-url <url>       Standalone Stellar RPC endpoint (default: ${DEFAULT_RPC_URL})
+  --deployment-timeout-seconds <n>
+                        Per-transaction deployment confirmation deadline (${DEFAULT_DEPLOYMENT_TIMEOUT_SECONDS}s default; 1-600)
   --output <path>       Results file, or - for JSON on stdout (default: ${DEFAULT_OUTPUT_PATH})
   --helper-path <path>  Use an existing compatible native simulation helper
   --json-stdout         Write JSON results to stdout instead of a file
@@ -81,6 +88,7 @@ export function parseArgs(
   let positionalCount = 0;
   let jsonStdout = false;
   let rpcUrl = DEFAULT_RPC_URL;
+  let deploymentTimeoutSeconds = DEFAULT_DEPLOYMENT_TIMEOUT_SECONDS;
   let helperPath: string | undefined;
   let allowCrossTargetSubstitution = false;
   let endOfOptions = false;
@@ -120,6 +128,13 @@ export function parseArgs(
       if (arg === "--rpc-url") {
         markScalar(arg);
         rpcUrl = nextValue(arg);
+        continue;
+      }
+      if (arg === "--deployment-timeout-seconds") {
+        markScalar(arg);
+        deploymentTimeoutSeconds = parseDeploymentTimeoutSeconds(
+          nextValue(arg),
+        );
         continue;
       }
       if (arg === "--output") {
@@ -205,6 +220,7 @@ export function parseArgs(
       fixturesPath: fixturesPath ?? DEFAULT_FIXTURES_PATH,
       outputPath: jsonStdout ? null : (outputFile ?? DEFAULT_OUTPUT_PATH),
       rpcUrl,
+      deploymentTimeoutSeconds,
       helperPath,
       jsonStdout,
       allowCrossTargetSubstitution,
@@ -243,6 +259,7 @@ async function main() {
     fixturesPath,
     outputPath,
     rpcUrl,
+    deploymentTimeoutSeconds,
     jsonStdout,
     helperPath,
     allowCrossTargetSubstitution,
@@ -298,6 +315,7 @@ async function main() {
     console.log(`Fixtures: ${fixturesPath}`);
     console.log(`Output:   ${jsonStdout ? "stdout" : outputPath}`);
     console.log(`RPC URL:  ${sanitizeEndpoint(rpcUrl)}`);
+    console.log(`Deployment timeout: ${deploymentTimeoutSeconds}s`);
     console.log(`Commit:   ${gitCommit}`);
     console.log(`SDK:      ${sdkSummary}`);
 
@@ -306,6 +324,7 @@ async function main() {
       fixturesPath,
       gitCommit,
       rpcUrl,
+      deploymentTimeoutSeconds,
       helperPath,
       allowCrossTargetSubstitution,
     });
@@ -326,6 +345,7 @@ async function main() {
         fixturesPath: baseFixturesPath,
         gitCommit: "unknown",
         rpcUrl,
+        deploymentTimeoutSeconds,
         helperPath,
         allowCrossTargetSubstitution,
       });

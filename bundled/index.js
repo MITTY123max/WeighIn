@@ -70924,6 +70924,27 @@ function resolveBinding(binding, declaredType, result) {
 
 // src/measurement.ts
 var DEFAULT_RPC_URL = "http://localhost:8000/rpc";
+var DEFAULT_DEPLOYMENT_TIMEOUT_SECONDS = 30;
+var MIN_DEPLOYMENT_TIMEOUT_SECONDS = 1;
+var MAX_DEPLOYMENT_TIMEOUT_SECONDS = 600;
+function parseDeploymentTimeoutSeconds(raw) {
+  if (!raw) return DEFAULT_DEPLOYMENT_TIMEOUT_SECONDS;
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(
+      `deployment-timeout-seconds must be an integer between ${MIN_DEPLOYMENT_TIMEOUT_SECONDS} and ${MAX_DEPLOYMENT_TIMEOUT_SECONDS} seconds`
+    );
+  }
+  const seconds = Number(raw);
+  validateDeploymentTimeoutSeconds(seconds);
+  return seconds;
+}
+function validateDeploymentTimeoutSeconds(seconds) {
+  if (!Number.isSafeInteger(seconds) || seconds < MIN_DEPLOYMENT_TIMEOUT_SECONDS || seconds > MAX_DEPLOYMENT_TIMEOUT_SECONDS) {
+    throw new Error(
+      `deployment timeout must be an integer between ${MIN_DEPLOYMENT_TIMEOUT_SECONDS} and ${MAX_DEPLOYMENT_TIMEOUT_SECONDS} seconds`
+    );
+  }
+}
 function metricsFromSimulation(output2, limits) {
   validateFootprintKeys(
     output2.read_only_keys,
@@ -71130,35 +71151,87 @@ async function getOrInitAccount(keyFile, rpcUrl, signal) {
   await ensureAccountReady(rpcUrl, keypair.publicKey(), signal);
   return keypair;
 }
-async function waitForTransaction(server, txHash, signal) {
-  for (let i = 0; i < 30; i++) {
+var TRANSACTION_POLL_INTERVAL_MS = 1e3;
+async function getTransactionBeforeDeadline(server, txHash, timeoutMs, signal) {
+  let timeout;
+  let onAbort;
+  const timeoutPromise = new Promise((resolve9) => {
+    timeout = setTimeout(() => resolve9({ kind: "timeout" }), timeoutMs);
+  });
+  const abortedPromise = signal ? new Promise((resolve9) => {
+    onAbort = () => resolve9({ kind: "aborted" });
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  }) : new Promise(() => {
+  });
+  try {
+    const requestPromise = server.getTransaction(txHash).then(
+      (response) => ({ kind: "response", response }),
+      (error63) => ({ kind: "error", error: error63 })
+    );
+    const outcome = await Promise.race([
+      requestPromise,
+      timeoutPromise,
+      abortedPromise
+    ]);
+    if (outcome.kind === "timeout") return void 0;
+    if (outcome.kind === "aborted") {
+      throw signal?.reason || new Error("Transaction confirmation cancelled");
+    }
+    if (outcome.kind === "error") throw outcome.error;
+    return outcome.response;
+  } finally {
+    if (timeout) clearTimeout(timeout);
+    if (onAbort) signal?.removeEventListener("abort", onAbort);
+  }
+}
+function waitForTransactionPoll(milliseconds, signal) {
+  return new Promise((resolve9, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason || new Error("Transaction confirmation cancelled"));
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve9();
+    }, milliseconds);
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(signal?.reason || new Error("Transaction confirmation cancelled"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+async function waitForTransaction(server, txHash, phase, timeoutSeconds, signal) {
+  const startedAt = Date.now();
+  const deadline = startedAt + timeoutSeconds * 1e3;
+  while (Date.now() < deadline) {
     if (signal?.aborted) {
       throw signal.reason || new Error("Transaction confirmation cancelled");
     }
-    const tx = await server.getTransaction(txHash);
+    const remaining = deadline - Date.now();
+    const tx = await getTransactionBeforeDeadline(
+      server,
+      txHash,
+      remaining,
+      signal
+    );
+    if (!tx) break;
+    if (Date.now() >= deadline) break;
     if (tx.status !== "NOT_FOUND") {
       return tx;
     }
-    await new Promise((resolve9, reject) => {
-      const timer = setTimeout(resolve9, 1e3);
-      if (signal) {
-        const onAbort = () => {
-          clearTimeout(timer);
-          reject(
-            signal.reason || new Error("Transaction confirmation cancelled")
-          );
-        };
-        if (signal.aborted) {
-          clearTimeout(timer);
-          return reject(
-            signal.reason || new Error("Transaction confirmation cancelled")
-          );
-        }
-        signal.addEventListener("abort", onAbort, { once: true });
-      }
-    });
+    const pollDelay = Math.min(
+      TRANSACTION_POLL_INTERVAL_MS,
+      deadline - Date.now()
+    );
+    if (pollDelay > 0) await waitForTransactionPoll(pollDelay, signal);
   }
-  throw new Error(`Transaction ${txHash} not found after 30 seconds`);
+  const elapsedSeconds = ((Date.now() - startedAt) / 1e3).toFixed(1);
+  throw new Error(
+    `Transaction confirmation deadline expired during ${phase} (hash=${txHash}, elapsed=${elapsedSeconds}s, timeout=${timeoutSeconds}s)`
+  );
 }
 var TX_HASH_PATTERN = /^[0-9a-f]{64}$/i;
 function isTransactionHash(value) {
@@ -71182,7 +71255,7 @@ function scrubEndpoint(message, rpcUrl) {
 function hashLabel(hash3) {
   return isTransactionHash(hash3) ? hash3 : "none";
 }
-async function submitAndConfirm(server, prepared, phase, rpcUrl, signal) {
+async function submitAndConfirm(server, prepared, phase, rpcUrl, timeoutSeconds, signal) {
   if (signal?.aborted) {
     throw signal.reason || new Error(`${phase} cancelled`);
   }
@@ -71218,7 +71291,13 @@ async function submitAndConfirm(server, prepared, phase, rpcUrl, signal) {
       `${phase} submission returned an invalid response (status=${status}): missing or invalid transaction hash`
     );
   }
-  const confirmed = await waitForTransaction(server, submission.hash, signal);
+  const confirmed = await waitForTransaction(
+    server,
+    submission.hash,
+    phase,
+    timeoutSeconds,
+    signal
+  );
   if (confirmed.status !== rpc_exports.Api.GetTransactionStatus.SUCCESS) {
     throw new Error(
       `${phase} transaction ${submission.hash} did not succeed (status=${confirmed.status})`
@@ -71356,6 +71435,8 @@ async function probeContractCode(server, wasmHash, contractId) {
 }
 async function ensureContractDeployed(options) {
   const { server, deployer, deployerAddress, wasmBytes, wasmHash, salt } = options;
+  const deploymentTimeoutSeconds = options.deploymentTimeoutSeconds ?? DEFAULT_DEPLOYMENT_TIMEOUT_SECONDS;
+  validateDeploymentTimeoutSeconds(deploymentTimeoutSeconds);
   if (options.minTtlLedgers !== void 0) {
     assertValidMinTtl(options.minTtlLedgers);
   }
@@ -71403,6 +71484,7 @@ async function ensureContractDeployed(options) {
     preparedUpload,
     "WASM upload",
     options.rpcUrl,
+    deploymentTimeoutSeconds,
     options.signal
   );
   console.log(`WASM installed. Deploying contract instance...`);
@@ -71424,6 +71506,7 @@ async function ensureContractDeployed(options) {
     preparedCreate,
     "contract creation",
     options.rpcUrl,
+    deploymentTimeoutSeconds,
     options.signal
   );
   const result = created.returnValue;
@@ -71578,6 +71661,9 @@ async function runMeasurement(fixturesPathOrOptions, gitCommit, sdkVersion, rpcU
   if (opts.signal?.aborted) {
     throw opts.signal.reason || new Error("Measurement cancelled by caller");
   }
+  if (opts.deploymentTimeoutSeconds !== void 0) {
+    validateDeploymentTimeoutSeconds(opts.deploymentTimeoutSeconds);
+  }
   if (opts.minTtlLedgers !== void 0) {
     assertValidMinTtl(opts.minTtlLedgers);
   }
@@ -71645,6 +71731,7 @@ async function measureWithKeyFile(opts, keyFile) {
         salt,
         contractId,
         rpcUrl: effectiveRpcUrl,
+        deploymentTimeoutSeconds: opts.deploymentTimeoutSeconds,
         signal: opts.signal,
         minTtlLedgers: opts.minTtlLedgers
       });
@@ -73751,6 +73838,9 @@ async function run(signal, scope) {
     const trustedPolicyRef = core4.getInput("trusted-policy-ref").trim();
     const trustedPolicyPath = core4.getInput("trusted-policy-path").trim();
     const rpcUrl = core4.getInput("rpc-url") || "http://localhost:8000/rpc";
+    const deploymentTimeoutSeconds = parseDeploymentTimeoutSeconds(
+      core4.getInput("deployment-timeout-seconds")
+    );
     configuredRpcUrl = rpcUrl;
     const githubToken = core4.getInput("github-token");
     const commentAuthorModeRaw = core4.getInput("comment-author-mode") || "github-actions";
@@ -73794,6 +73884,9 @@ async function run(signal, scope) {
     sharedKeyFile = path10.join(keyDir, "weighin-deployer.key");
     core4.info(`Base ref:   ${baseRef}`);
     core4.info(`RPC URL:    ${sanitizeEndpoint(rpcUrl)}`);
+    core4.info(
+      `Deployment confirmation deadline: ${deploymentTimeoutSeconds}s (default ${DEFAULT_DEPLOYMENT_TIMEOUT_SECONDS}s)`
+    );
     core4.info(`Fixtures:   ${fixturesPathRel}`);
     core4.info(`Key file:   ${sharedKeyFile}`);
     await assertRpcHealthy(rpcUrl, signal);
@@ -73854,6 +73947,7 @@ Commit or stash changes before running benchmarks.`
         gitCommit: headSha,
         sdkVersion: getSdkVersion(headWorkspace),
         rpcUrl,
+        deploymentTimeoutSeconds,
         keyFile: sharedKeyFile,
         allowCrossTargetSubstitution,
         signal
@@ -73899,6 +73993,7 @@ Commit or stash changes before running benchmarks.`
           gitCommit: baseSha,
           sdkVersion: getSdkVersion(baseDir),
           rpcUrl,
+          deploymentTimeoutSeconds,
           keyFile: sharedKeyFile,
           allowCrossTargetSubstitution
         });

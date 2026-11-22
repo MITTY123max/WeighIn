@@ -205,6 +205,7 @@ All supported inputs are declared in [action.yml](action.yml):
 | `trusted-policy-ref` | Optional ref fetched from `origin` for an immutable policy source; must be paired with `trusted-policy-path` |
 | `trusted-policy-path` | Repository path read from the resolved trusted policy commit; HEAD cannot replace it |
 | `rpc-url` | Compatible standalone RPC; default `http://localhost:8000/rpc` |
+| `deployment-timeout-seconds` | Per-transaction deployment confirmation deadline in seconds; integer from 1 to 600, default 30 |
 | `base-ref` | Baseline branch, tag, or commit SHA; PR base branch, otherwise `main`, if omitted. Invalid refs are rejected before builds or deployment. |
 | `rust-toolchain` | Contract-build Rustup override; does not change pinned native-helper toolchain |
 | `build-command` | Custom shell build command in each revision; replaces default build guarantees |
@@ -306,7 +307,9 @@ The CLI measures existing WASMs and writes JSON; it does not build, compare
 revisions, enforce thresholds or post comments. Provision the native helper/RPC,
 then run `node dist/cli.js <fixtures.json> --rpc-url <standalone-rpc> --output <results.json>`
 from a built checkout. Pass `--helper-path <path>` to use an existing compatible
-native helper. See [native provisioning](docs/native-measurement.md).
+native helper. `--deployment-timeout-seconds <n>` sets the per-transaction
+deployment confirmation deadline (1–600 seconds, default 30). See
+[native provisioning](docs/native-measurement.md).
 
 Run `node dist/cli.js --help` (or `-h`) for supported usage and
 `node dist/cli.js --version` for the installed package version. Both are
@@ -317,12 +320,13 @@ they write no result file.
 The argument grammar is `weighin [options] [fixtures.json] [results.json]`.
 Zero positionals use the documented defaults, the first positional selects the
 fixtures file and the second selects the legacy positional output path.
-`--rpc-url <url>` and `--output <path>` accept exactly one value and may appear
-in any order (`--output -` writes JSON to stdout). A token beginning with `--`
-is never treated as an option value, and `--` ends option parsing so positional
-paths may begin with a dash. Unknown options, missing values, duplicate scalar
-options (`--rpc-url`, `--output`, `--helper-path`), extra positionals and
-combining a positional output with `--output` are rejected with a usage
+`--rpc-url <url>`, `--deployment-timeout-seconds <n>` and `--output <path>`
+accept exactly one value and may appear in any order (`--output -` writes JSON
+to stdout). A token beginning with `--` is never treated as an option value,
+and `--` ends option parsing so positional paths may begin with a dash. Unknown
+options, missing values, duplicate scalar options (`--rpc-url`,
+`--deployment-timeout-seconds`, `--output`, `--helper-path`), extra positionals
+and combining a positional output with `--output` are rejected with a usage
 diagnostic before any fixture, Git or RPC work.
 
 SDK metadata is reported per contract from the Cargo workspace/lock owning each
