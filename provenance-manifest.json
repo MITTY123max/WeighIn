@@ -13,7 +13,7 @@
     },
     {
       "path": "bundled/comment-action.js",
-      "sha256": "70c9da02d591246a5020f2d7223a9132f3aebd97e97c4659b665d9d4ebca1ab5"
+      "sha256": "e5038f12f24c41bb2df8b7ec7f6d1bd6b420309c29692eb515f6faa8647a9375"
     },
     {
       "path": "bundled/index.js",
@@ -98,6 +98,10 @@
     {
       "path": "src/diff.ts",
       "sha256": "89f02678abc3ab845f5ee6ef8042108b5ec550f4c10f1bf03d428347bf26a51b"
+    },
+    {
+      "path": "src/doctor.ts",
+      "sha256": "8855806988fe23f4421788350b65cf8672bd47b88f6e20e3d882511b359938b6"
     },
     {
       "path": "src/endpoint.ts",

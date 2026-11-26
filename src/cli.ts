@@ -11,6 +11,7 @@ import { buildDiffSummaryRows } from "./diff-summary";
 import { enforceThresholds, loadConfig } from "./threshold";
 import { discoverSdkAssociations, formatSdkVersions } from "./sdk-version";
 import { redactEndpointSecrets, sanitizeEndpoint } from "./endpoint";
+import { runDoctor, formatDoctorReport } from "./doctor";
 
 function getGitCommit(): string {
   try {
@@ -51,6 +52,8 @@ const DEFAULT_RPC_URL = "http://localhost:8000/rpc";
 
 export const USAGE = "Usage: weighin [options] [fixtures.json] [results.json]";
 
+export const DOCTOR_USAGE = "Usage: weighin doctor [--rpc-url <url>]";
+
 export const HELP_TEXT = `${USAGE}
 
 Measure Soroban contract resource usage from existing fixture declarations.
@@ -77,7 +80,11 @@ Options:
   --dry-run             Validate config, fixtures, and WASM paths without RPC
   --                    Treat remaining arguments as positional paths
   -h, --help            Show this help and exit
-  --version             Show the installed package version and exit`;
+  --version             Show the installed package version and exit
+
+Subcommands:
+  doctor                Check the local environment for required prerequisites
+                        (read-only; exits 0 when healthy, 1 when not)`;
 
 function readPackageVersion(): string {
   const packagePath = path.resolve(__dirname, "..", "package.json");
@@ -331,6 +338,14 @@ async function main() {
       process.stdout.write(`${readPackageVersion()}\n`);
     } catch (err: any) {
       console.error(err.message);
+      process.exit(1);
+    }
+    return;
+  }
+  if (command.kind === "doctor") {
+    const report = await runDoctor({ rpcUrl: command.rpcUrl });
+    process.stdout.write(`${formatDoctorReport(report)}\n`);
+    if (!report.healthy) {
       process.exit(1);
     }
     return;
